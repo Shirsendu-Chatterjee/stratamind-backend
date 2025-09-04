@@ -2,6 +2,7 @@ import os
 import tempfile
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
+
 from langchain_groq import ChatGroq
 from langchain.chains import RetrievalQA
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -11,7 +12,9 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 app = FastAPI()
 
-# Allow frontend (adjust origin if needed)
+print("Backend starting...")  # helps Render detect server start
+
+# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,49 +23,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load Groq API Key
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Initialize embedding model
+# Small embedding model
 embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+# Store in-memory DB per session
+app.state.vectordb = None
 
 @app.post("/upload")
 async def upload_file(file: UploadFile):
-    """Upload file and build temporary vector DB"""
-    # Save temp file
     suffix = file.filename.split(".")[-1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
     # Load document
-    if suffix.lower() == "pdf":
-        loader = PyPDFLoader(tmp_path)
-    else:
-        loader = TextLoader(tmp_path)
+    loader = PyPDFLoader(tmp_path) if suffix.lower() == "pdf" else TextLoader(tmp_path)
     documents = loader.load()
 
-    # Split
+    # Split into chunks
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     docs = splitter.split_documents(documents)
 
-    # Create vector DB in memory
+    # Create in-memory vector DB
     vectordb = Chroma.from_documents(docs, embedding_model)
-
-    # Save reference
     app.state.vectordb = vectordb
+
     return {"message": f"File {file.filename} processed successfully."}
 
 @app.post("/ask")
 async def ask_question(question: str = Form(...)):
-    """Ask a question based on uploaded document"""
-    if not hasattr(app.state, "vectordb"):
-        return {"error": "Please upload a file first."}
+    if not app.state.vectordb:
+        return {"error": "Upload a file first."}
 
     retriever = app.state.vectordb.as_retriever()
 
+    # Small Groq model for free tier
     llm = ChatGroq(
-        model_name="llama-3.3-70b-versatile",
+        model_name="llama-3.3-3b-versatile",  # smaller model
         temperature=0,
         api_key=GROQ_API_KEY,
     )
@@ -71,3 +70,12 @@ async def ask_question(question: str = Form(...)):
     answer = qa.run(question)
 
     return {"answer": answer}
+
+# For Render free tier detection
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
