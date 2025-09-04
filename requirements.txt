@@ -7,4 +7,6 @@ langchain-groq
 chromadb
 pypdf
 sentence-transformers
+python-multipart
+
 
