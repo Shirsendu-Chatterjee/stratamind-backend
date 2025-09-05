@@ -1,9 +1,6 @@
 fastapi
 uvicorn
 langchain
-langchain-community
-langchain-huggingface
 langchain-groq
-chromadb
+langchain-chroma
 sentence-transformers
-python-multipart
