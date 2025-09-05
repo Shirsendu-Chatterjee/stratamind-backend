@@ -1,71 +1,72 @@
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
-from langchain.chains import RetrievalQA
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.schema import Document
 import os
 
+# Init FastAPI
 app = FastAPI()
 
-# Allow CORS for frontend
+# Allow CORS (so frontend can call this backend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to frontend URL in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Groq API key (set this in HF Spaces secrets!)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Lightweight embeddings
-embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# Create embeddings & LLM
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+llm = ChatGroq(model_name="llama-3.1-8b-instant", groq_api_key=GROQ_API_KEY)
 
-# Store vector DB per session
-user_vectordbs = {}
+# Temporary in-memory store (one per session)
+user_vectorstores = {}
 
-# Upload text
-@app.post("/upload")
-async def upload_text(session_id: str = Form(...), text: str = Form(...)):
-    documents = [Document(page_content=text)]
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    docs = splitter.split_documents(documents)
+class QueryRequest(BaseModel):
+    query: str
+    session_id: str
 
-    vectordb = Chroma.from_documents(docs, embedding_model)
-    user_vectordbs[session_id] = vectordb
-    return {"message": "Text uploaded and knowledge base created."}
+@app.post("/ingest/{session_id}")
+async def ingest_text(session_id: str, request: Request):
+    data = await request.json()
+    text = data.get("text", "")
 
-# Ask question
-@app.post("/ask")
-async def ask_question(session_id: str = Form(...), question: str = Form(...)):
-    vectordb = user_vectordbs.get(session_id)
-    if not vectordb:
-        return {"error": "Upload text first."}
+    if not text.strip():
+        return {"error": "No text provided"}
 
-    retriever = vectordb.as_retriever()
+    # Split text into chunks
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    docs = [Document(page_content=chunk) for chunk in splitter.split_text(text)]
 
-    llm = ChatGroq(
-        model_name="llama-3.3-3b",  # Must match your free-tier key
-        temperature=0,
-        api_key=GROQ_API_KEY
-    )
+    # Create a Chroma vectorstore for this session
+    vectorstore = Chroma.from_documents(docs, embedding=embeddings, persist_directory=f"db_{session_id}")
+    user_vectorstores[session_id] = vectorstore
 
-    qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type="stuff")
-    answer = qa.run(question)
-    return {"answer": answer}
+    return {"status": "Text ingested"}
 
-# End session
-@app.post("/end_session")
-async def end_session(session_id: str = Form(...)):
-    if session_id in user_vectordbs:
-        del user_vectordbs[session_id]
-    return {"message": "Session ended and knowledge base deleted."}
+@app.post("/query")
+async def query_rag(req: QueryRequest):
+    session_id = req.session_id
+    query = req.query
 
-# Render entrypoint
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    if session_id not in user_vectorstores:
+        return {"error": "No knowledge base found for this session"}
+
+    retriever = user_vectorstores[session_id].as_retriever()
+    docs = retriever.get_relevant_documents(query)
+
+    # Build context
+    context = "\n".join([doc.page_content for doc in docs])
+    prompt = f"Answer based on the following context:\n{context}\n\nQuestion: {query}\nAnswer:"
+
+    result = llm.invoke(prompt)
+
+    return {"answer": result.content}
