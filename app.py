@@ -1,17 +1,18 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from langchain_chroma import Chroma
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from langchain_groq import ChatGroq
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
 from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.schema import Document
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.chains import RetrievalQA
 import os
 
-# Init FastAPI
 app = FastAPI()
 
-# Allow CORS (so frontend can call this backend)
+# frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,55 +21,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Groq API key (set this in HF Spaces secrets!)
+# @app.get("/")
+# def serve_frontend():
+#     return FileResponse(os.path.join(frontend_dir, "index.html"))
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Create embeddings & LLM
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-llm = ChatGroq(model_name="llama-3.1-8b-instant", groq_api_key=GROQ_API_KEY)
+embeddings = HuggingFaceEmbeddings(model_name="paraphrase-MiniLM-L3-v2")
+qa = None
 
-# Temporary in-memory store (one per session)
-user_vectorstores = {}
+@app.post("/upload_text/")
+async def upload_text(file: UploadFile):
+    global qa
+    contents = await file.read()
+    text = contents.decode("utf-8")
+    splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    docs = splitter.split_text(text)
+    vectordb = Chroma.from_texts(docs, embedding=embeddings)
+    retriever = vectordb.as_retriever()
+    llm = ChatGroq(
+        groq_api_key=GROQ_API_KEY,
+        model_name="allam-2-7b",
+        temperature=0.2,
+    )
+    qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
+    return {"message": "File uploaded successfully!", "filename": file.filename}
 
-class QueryRequest(BaseModel):
-    query: str
-    session_id: str
-
-@app.post("/ingest/{session_id}")
-async def ingest_text(session_id: str, request: Request):
-    data = await request.json()
-    text = data.get("text", "")
-
-    if not text.strip():
-        return {"error": "No text provided"}
-
-    # Split text into chunks
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    docs = [Document(page_content=chunk) for chunk in splitter.split_text(text)]
-
-    # Create a Chroma vectorstore for this session
-    vectorstore = Chroma.from_documents(docs, embedding=embeddings, persist_directory=f"db_{session_id}")
-    user_vectorstores[session_id] = vectorstore
-
-    return {"status": "Text ingested"}
-
-@app.post("/query")
-async def query_rag(req: QueryRequest):
-    session_id = req.session_id
-    query = req.query
-
-    if session_id not in user_vectorstores:
-        return {"error": "No knowledge base found for this session"}
-
-    retriever = user_vectorstores[session_id].as_retriever()
-    docs = retriever.get_relevant_documents(query)
-
-    # Build context
-    context = "\n".join([doc.page_content for doc in docs])
-    prompt = f"Answer based on the following context:\n{context}\n\nQuestion: {query}\nAnswer:"
-
-    result = llm.invoke(prompt)
-
-    return {"answer": result.content}
-
-
+@app.post("/ask/")
+async def ask_question(question: str = Form(...)):
+    global qa
+    if qa is None:
+        return {"answer": "❌ No knowledge uploaded yet."}
+    result = await qa.arun(question)
+    return {"answer": result}
